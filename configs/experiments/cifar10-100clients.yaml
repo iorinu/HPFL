@@ -1,0 +1,29 @@
+# 論文の完全再現ではなく、明示した実データ実験用プリセット。
+runner:
+  mode: real
+dataset: cifar10
+data_dir: .local-data/cifar10
+model: resnet18_v2
+num_classes: 10
+model_output_dim: 10
+partition_method: hetero
+partition_alpha: 0.1
+client_num_in_total: 100
+client_num_per_round: 5
+comm_round: 1000
+global_epochs_per_round: 1
+HPFL_local_iteration: 1
+batch_size: 128
+client_optimizer: sgd
+lr: 0.1
+momentum: 0.0
+wd: 0.0001
+sched: 'no'
+HPFL: true
+freeze_layer: 1
+noise_on_feat: true
+# 上流 default と同じ選択。論文の全詳細を検証した意味ではない。
+noise_on_test_feat: false
+noisy_coefficient: 1
+noise_type: stat
+group_feat: false

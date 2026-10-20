@@ -1,5 +1,11 @@
 # CPU ローカル synthetic smoke
 
+> 現在の入口は [YAML実験設定・共通runner](experiment-config.md)。
+> `bash tools/run-local-smoke.sh [--device cuda]` は互換入口として維持し、
+> 条件は `configs/experiments/smoke.yaml`、新規出力は `.local-experiments/launch-*/experiment/` に移した。
+> 新runnerのNix起動はGit flake（`.` / `.#gpu`）を使用する。以下の歴史的なpath flakeコマンドは再実行を推奨しない。
+> 以下の `.local-smoke/` の結果・旧コマンド・環境説明は当時の履歴であり、成果物は移動・削除していない。
+
 ## 目的と確認範囲
 
 上流 SHA: `c21ebf2a7b03a03262afae218a98a427fb89fa9a`。

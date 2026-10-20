@@ -84,3 +84,5 @@ CIFAR-10.1/*
 # ローカル合成データ smoke の固有実行出力
 /.local-smoke/
 /.pytest_cache/
+/.local-experiments/
+/.local-data/

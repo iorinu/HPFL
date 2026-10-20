@@ -1,0 +1,28 @@
+# CIFAR は形状名のみ。実データ入口は必ず合成データに置換する。
+runner:
+  mode: synthetic
+  train_per_client: 16
+  test_per_client: 8
+client_num_in_total: 2
+client_num_per_round: 2
+batch_size: 8
+comm_round: 1
+global_epochs_per_round: 1
+HPFL: true
+HPFL_local_iteration: 1
+algorithm: FedAvg
+model: resnet18_v2
+dataset: cifar10
+num_classes: 2
+model_output_dim: 2
+client_optimizer: sgd
+server_optimizer: 'no'
+psgd_exchange: model
+data_load_num_workers: 0
+seed: 7
+lr: 0.01
+noise_on_feat: false
+noise_on_test_feat: false
+freeze_layer: 1
+checkpoint_save: false
+data_dir: .local-data/cifar10
