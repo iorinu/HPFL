@@ -2,7 +2,6 @@ import os
 import logging
 import copy
 
-from numpy.lib.function_base import kaiser
 
 import torch
 import torch.nn as nn

@@ -354,7 +354,7 @@ class NormalTrainer(ModelTrainer):
 
     def get_train_batch_data(self, train_local):
         try:
-            train_batch_data = self.train_local_iter.next()
+            train_batch_data = next(self.train_local_iter)
             # logging.debug("len(train_batch_data[0]): {}".format(len(train_batch_data[0])))
             if len(train_batch_data[0]) < self.args.batch_size:
                 logging.debug("WARNING: len(train_batch_data[0]): {} < self.args.batch_size: {}".format(
@@ -363,7 +363,7 @@ class NormalTrainer(ModelTrainer):
                 # logging.debug("train_batch_data[0].shape: {}".format(train_batch_data[0].shape))
         except:
             self.train_local_iter = iter(train_local)
-            train_batch_data = self.train_local_iter.next()
+            train_batch_data = next(self.train_local_iter)
         return train_batch_data
 
 
