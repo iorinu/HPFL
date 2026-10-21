@@ -35,7 +35,11 @@ def execute_run(cfg, device, source, command, output=None, timeout=None, overrid
         (run / "command.json").write_text(json.dumps(command, ensure_ascii=False) + "\n")
         bound = timeout if timeout is not None else (180 if cfg.runner.mode == "synthetic" else None)
         (run / "execution.json").write_text(json.dumps(dict(device=device, mode=cfg.runner.mode,
-                                                              timeout_seconds=bound), indent=2) + "\n")
+                                                              timeout_seconds=bound,
+                                                              execution_backend=cfg.runner.execution_backend,
+                                                              max_concurrent_clients=cfg.runner.max_concurrent_clients,
+                                                              client_timeout_seconds=cfg.runner.client_timeout_seconds,
+                                                              rng_policy=hpfl_config(cfg).client_rng_policy), indent=2) + "\n")
         artifacts = run / "artifacts"
         artifacts.mkdir()
         worker = [sys.executable, "-u", str(Path(__file__).resolve()), "--worker",

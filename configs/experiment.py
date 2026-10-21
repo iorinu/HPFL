@@ -27,7 +27,9 @@ def validate_supplied(values, prefix=""):
 
 def load_experiment(path, overrides=()):
     cfg = get_cfg()
-    cfg.runner = CN(dict(mode="real", train_per_client=16, test_per_client=8))
+    cfg.runner = CN(dict(mode="real", train_per_client=16, test_per_client=8,
+                         execution_backend="sequential", max_concurrent_clients=1,
+                         client_timeout_seconds=120.0))
     cfg.wandb_record = False
     cfg.wandb_key = None
     cfg.gpu_index = 0
@@ -38,6 +40,10 @@ def load_experiment(path, overrides=()):
         if not isinstance(supplied, dict):
             raise ValueError("YAML の最上位は mapping が必要です")
         validate_supplied(supplied)
+        internal_execution_keys = {"client_execution_backend", "max_concurrent_clients",
+                                   "client_timeout_seconds", "client_rng_policy"}
+        if internal_execution_keys.intersection(supplied) or internal_execution_keys.intersection(overrides[::2]):
+            raise ValueError("実行設定は runner.* キーだけで指定してください")
         cfg.merge_from_other_cfg(CN(supplied))
         if len(overrides) % 2:
             raise ValueError("CLI 上書きは KEY VALUE の組が必要です")
@@ -57,6 +63,18 @@ def load_experiment(path, overrides=()):
         validate_supplied({key: value})
     if cfg.runner.mode not in ("synthetic", "real"):
         raise ValueError("runner.mode: synthetic または real が必要です")
+    if cfg.runner.execution_backend not in ("sequential", "process"):
+        raise ValueError("runner.execution_backend: sequential または process が必要です")
+    count = cfg.runner.max_concurrent_clients
+    if type(count) is not int or not 1 <= count <= 2:
+        raise ValueError("runner.max_concurrent_clients: 1 または 2 の整数が必要です")
+    if cfg.runner.execution_backend == "sequential" and count != 1:
+        raise ValueError("sequential は並行数 1 のみ対応します")
+    seconds = cfg.runner.client_timeout_seconds
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("runner.client_timeout_seconds: 有限の正数が必要です")
+    if cfg.runner.execution_backend == "process":
+        validate_process_config(cfg)
     for key in ("client_num_in_total", "client_num_per_round", "batch_size", "comm_round",
                 "max_epochs", "global_epochs_per_round", "HPFL_local_iteration", "num_classes",
                 "model_output_dim", "frequency_of_the_test"):
@@ -82,7 +100,7 @@ def load_experiment(path, overrides=()):
             raise ValueError(f"{key}: 固有出力内の相対パスが必要です")
     if cfg.runner.mode == "real":
         if any(key in supplied.get("runner", {}) for key in ("train_per_client", "test_per_client")) or any(
-                key.startswith("runner.") and key != "runner.mode" for key in overrides[::2]):
+                key in ("runner.train_per_client", "runner.test_per_client") for key in overrides[::2]):
             raise ValueError("runner の合成件数設定は synthetic 専用です")
     if cfg.comm_round * cfg.global_epochs_per_round != cfg.max_epochs:
         raise ValueError("max_epochs = comm_round * global_epochs_per_round が必要です（上流の round 算出）")
@@ -110,10 +128,59 @@ def load_experiment(path, overrides=()):
     cfg.data_dir = str((ROOT / cfg.data_dir).resolve())
     if not Path(cfg.data_dir).is_relative_to(ROOT / ".local-data"):
         raise ValueError("data_dir: データはリポジトリ内 .local-data 以下に保存してください")
+    # effective.yaml にも公式コードへ渡す実効ポリシーを記録する。
+    cfg.client_execution_backend = cfg.runner.execution_backend
+    cfg.max_concurrent_clients = cfg.runner.max_concurrent_clients
+    cfg.client_timeout_seconds = cfg.runner.client_timeout_seconds
+    cfg.client_rng_policy = ("task-sha256-v1" if cfg.runner.execution_backend == "process"
+                             else "historical-global")
     return cfg
 
 
 def hpfl_config(cfg):
     resolved = cfg.clone()
+    resolved.client_execution_backend = cfg.runner.execution_backend
+    resolved.max_concurrent_clients = cfg.runner.max_concurrent_clients
+    resolved.client_timeout_seconds = cfg.runner.client_timeout_seconds
+    resolved.client_rng_policy = ("task-sha256-v1" if cfg.runner.execution_backend == "process"
+                                  else "historical-global")
     del resolved["runner"]
     return resolved
+
+
+def validate_process_config(cfg):
+    """状態転送を保証できない特殊経路はデータ取得前に拒否する。"""
+    expected = dict(algorithm="FedAvg", HPFL=True, mode="standalone", task="classification",
+                    model="resnet18_v2", dataset="cifar10", trainer_type="normal",
+                    loss_fn="CrossEntropy", instantiate_all=True, exchange_model=True,
+                    fedavg_local_step_type="whole", data_sampler="Random", compression=None,
+                    scaffold=False, fedprox=False, VHL=False, fed_align=False,
+                    if_get_diff=False, if_OOD=False, fedavg_cfl=False, finetune_FedAvg=False,
+                    central_trainning_epoch=0, trainer_param_groups=False,
+                    record_dataframe=False, model_out_feature=False, TwoCropTransform=False,
+                    freeze_backbone=False, pretrained=False, pretrained_submodel=False,
+                    load_backbone_from=None, if_timm_dataset=False, CIFAR_10_1=False,
+                    pruning=False, gate_layer=False, dynamic_network=None, fixed_network=False,
+                    normal_supcon_loss=False, imbalance_loss_reweight=False,
+                    Contrastive="no", data_transform="NormalTransform", data_efficient_load=True,
+                    dataset_resize=False, model_input_channels=3, reduce_plug=False,
+                    client_select="random", dirichlet_balance=False, dirichlet_min_p=None,
+                    frequency_of_the_test=1,
+                    aggregate_in_parallel=False, wandb_record=False,
+                    wandb_save_record_dataframe=False)
+    for key in cfg:
+        if key.endswith("_track"):
+            expected[key] = False
+    for key, value in expected.items():
+        if cfg[key] != value:
+            raise ValueError(f"process 非対応: {key} は {value} のみ対応します")
+    if cfg.client_optimizer not in ("no", "sgd"):
+        raise ValueError("process: client_optimizer は no/sgd のみ対応します")
+    if cfg.server_optimizer not in ("no", "sgd", "adam") or cfg.dataset_aug not in ("default", "no"):
+        raise ValueError("process: 未対応 server_optimizer/dataset_aug です")
+    if cfg.sched not in ("no", "StepLR", "MultiStepLR", "CosineAnnealingLR"):
+        raise ValueError("process: 未対応 scheduler です")
+    if type(cfg.freeze_layer) is not int or cfg.freeze_layer != 1:
+        raise ValueError("process: freeze_layer は 1 のみ対応します")
+    if cfg.noise_type not in ("stat", "random"):
+        raise ValueError("process: noise_type は stat/random が必要です")

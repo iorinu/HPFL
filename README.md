@@ -42,6 +42,22 @@ bash tools/run-experiment.sh --config configs/experiments/cifar10-100clients.yam
 出力は毎回固有の `.local-experiments/`、データは `.local-data/`。外部実験記録は無効。
 編集先は各YAML。`max_epochs` は省略時にround×local epochから自動算出する。
 共通runnerはGit flake（`.` / `.#gpu`）の依存環境とライブ作業ツリーを使い、git addは不要。
+
+### client並行学習（明示opt-in）
+
+既定のlegacy `sequential / 1` は維持する。標準FedAvg+HPFLの共有roundと最終headを、
+spawn workerで最大2clients並行実行できる（単一 `cuda:0`、またはCPU）。
+
+```bash
+bash tools/run-experiment.sh --config configs/experiments/smoke.yaml --device cuda runner.execution_backend process runner.max_concurrent_clients 2 comm_round 2 momentum 0.9
+```
+
+CPU確認は `--device cpu`、比較参照は `runner.max_concurrent_clients 1`。
+`runner.client_timeout_seconds` は既定120秒。全task成功後にsampling順で集約し、失敗時はworkerを回収して中止する。
+processは独立した`task-sha256-v1`乱数ポリシーであり、historical RNGとの一致は保証しない。
+CPU suiteに加え、[RTX 5060実機検証](docs/experiment-config.md#gpu-verification)でprocess/1対2の状態一致を確認。安定した高速化は未確認、kernel同時実行traceは未実施。
+特殊algorithm/loader等の未対応経路、設定、観測ログ、host/VRAMの限界は [詳細](docs/experiment-config.md#opt-in-の-bounded-process-client-学習) を参照。
+
 以下は上流の旧起動方法で、共通runnerはこれらのshell設定を読み込まない。
 
 1. Download and specific the data directory with parameter ``data_dir`` in command (For most dataset, the downloading will begin when runnning the script)
@@ -54,8 +70,6 @@ bash tools/run-experiment.sh --config configs/experiments/cifar10-100clients.yam
 If you do not want to use wandb for recording, you can add ``wandb_record=False`` in to the command (such as in experiments/standalone/auto_pipeline.sh and experiments/standalone/auto_pipeline_100client.sh). Then you don't need to install and config wandb.
 
 If else, please replace WANDB_KEY_EXAMPLE in configs/default.py, standalone/auto_pipeline.sh and experiments/standalone/auto_pipeline_100client.sh
-
-
 
 
 

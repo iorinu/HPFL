@@ -1,6 +1,7 @@
 import copy
 import logging
 import time
+from functools import wraps
 
 import torch
 import wandb
@@ -70,6 +71,19 @@ from loss_fn.cov_loss import (
 )
 from loss_fn.losses import LabelSmoothingCrossEntropy, proxy_align_loss, align_feature_loss
 # from memory_profiler import profile
+
+
+def _release_process_client_after_test(method):
+    """親の逐次評価後に全 client が CUDA に残留することを防ぐ。"""
+    @wraps(method)
+    def evaluate(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            if (getattr(self.args, "client_execution_backend", "sequential") == "process"
+                    and self.role == "client"):
+                self.model.cpu()
+    return evaluate
 
 
 class NormalTrainer(ModelTrainer):
@@ -1665,6 +1679,7 @@ class NormalTrainer(ModelTrainer):
         return loss, output, labels
 
     # test for one model
+    @_release_process_client_after_test
     def test(self, test_data, device=None, args=None, epoch=None,
             tracker=None, metrics=None,
             move_to_gpu=True, make_summary=True,
@@ -1847,7 +1862,6 @@ class NormalTrainer(ModelTrainer):
                 plt.title("t-SNE")
                 plt.savefig(image_path)
         return data_tsne, labels
-
 
 
 

@@ -156,6 +156,7 @@ def run_smoke(cfg, device_name, output):
         torch.manual_seed(args.seed)
         with patch("algorithms_standalone.basePS.basePSmanager.load_data", lambda **kw: synthetic_data(cfg)):
             manager = FedAVGManager(device, args)
+        manager.capture_process_history = True
         for client in manager.client_list:
             attach_device_probe(client.trainer, device, evidence, handles)
         attach_device_probe(manager.aggregator.trainer, device, evidence, handles)
@@ -164,20 +165,44 @@ def run_smoke(cfg, device_name, output):
         assert manager.server_timer.global_comm_round_idx == cfg.comm_round + 1
         assert len(manager.aggregator.model_list) == cfg.client_num_in_total
         assert len(manager.aggregator.dist_list) == cfg.client_num_in_total
+        process_mode = args.client_execution_backend == "process"
+        from algorithms_standalone.fedavg.process_worker import export_client, cpu_tree
+        torch.save(dict(clients=[export_client(c) for c in manager.client_list],
+                            global_model=cpu_tree(manager.aggregator.trainer.model.state_dict()),
+                            heads=[[cpu_tree(m.state_dict()) for m in head]
+                                   for head in manager.aggregator.model_list],
+                            markers=[[torch.as_tensor(v.copy()) for v in marker]
+                                     for marker in manager.aggregator.dist_list],
+                            history=manager.process_history),
+                   output / ("process-contract.pt" if process_mode else "legacy-contract.pt"))
+        evaluation_start = time.monotonic()
         manager.generate_personalized_data()
         manager.test_locally()
         manager.test_with_personalized_batch("index")
+        local_evaluation_end = time.monotonic()
         scores = []
         for loader in manager.test_data_local_dict.values():
             score, choice = manager.aggregator.select_pluggable(loader, "MMD")
             assert np.isfinite(score).all() and 0 <= choice < cfg.client_num_in_total
             scores.append({"score": score.tolist(), "choice": int(choice)})
+        selection_end = time.monotonic()
         manager.test_with_personalized_batch("MMD")
+        selection_evaluation_end = time.monotonic()
         batches = cfg.runner.train_per_client // cfg.batch_size
-        for counts in evidence[:cfg.client_num_in_total]:
+        for counts in ([] if process_mode else evidence[:cfg.client_num_in_total]):
             assert counts["shared_forwards"] == batches * cfg.global_epochs_per_round * cfg.comm_round
             assert counts["head_forwards"] == batches * cfg.HPFL_local_iteration
             assert counts["loss_calls"] > 0
+        if process_mode:
+            events = [json.loads(line) for line in (output / "client-execution.jsonl").read_text().splitlines()]
+            worker_evidence = [e for e in events if e["event"] == "client"]
+            assert len(worker_evidence) == cfg.client_num_in_total * (cfg.comm_round + 1)
+            for event in worker_evidence:
+                epochs = cfg.HPFL_local_iteration if event["phase"] == "head" else cfg.global_epochs_per_round
+                assert event["forward_calls"] == batches * epochs
+                assert event["device"] == str(device)
+        else:
+            worker_evidence = []
         assert mmd_evidence["calls"] > 0
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -199,13 +224,22 @@ def run_smoke(cfg, device_name, output):
                       train_per_client=cfg.runner.train_per_client, test_per_client=cfg.runner.test_per_client,
                       batch_size=cfg.batch_size, num_classes=cfg.num_classes,
                       model=args.model, markers=len(manager.aggregator.dist_list), mmd=scores, checkpoints=checkpoints,
-                      seconds=elapsed, device_evidence=evidence, mmd_evidence=mmd_evidence,
+                      seconds=elapsed, device_evidence=evidence, worker_evidence=worker_evidence,
+                      execution_backend=cfg.runner.execution_backend, rng_policy=args.client_rng_policy,
+                      mmd_evidence=mmd_evidence,
+                      post_training_seconds=dict(local_evaluation=local_evaluation_end-evaluation_start,
+                                                 mmd_selection=selection_end-local_evaluation_end,
+                                                 mmd_personalized_evaluation=selection_evaluation_end-selection_end),
                       peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                       vram=cuda_info if cuda_info else "未使用（CPU）", python=sys.version,
                       versions={name: importlib.metadata.version(name) for name in
                                 ["torch", "torchvision", "numpy", "scipy", "scikit-learn", "wandb"]})
         (output / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
         print(json.dumps(result, indent=2, ensure_ascii=False))
+    except BaseException as exc:
+        (output / "summary.json").write_text(json.dumps(dict(
+            status="failed", synthetic=True, device=device_name, error=str(exc)), ensure_ascii=False) + "\n")
+        raise
     finally:
         for handle in handles:
             handle.remove()

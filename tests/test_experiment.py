@@ -98,7 +98,8 @@ def test_yaml_controls_synthetic_data(tmp_path):
     assert set(data[5][1].dataset.targets) == {0, 1, 2}
 
 
-def test_real_dispatch_uses_official_main(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", ["sequential", "process"])
+def test_real_dispatch_uses_official_main(tmp_path, monkeypatch, backend):
     import json
     import os
     import sys
@@ -108,7 +109,8 @@ def test_real_dispatch_uses_official_main(tmp_path, monkeypatch):
     from configs.experiment import load_experiment
     from tools.run_experiment import dispatch
 
-    cfg = load_experiment(ROOT / "configs/experiments/cifar10-10clients.yaml", ["HPFL_local_iteration", "10"])
+    cfg = load_experiment(ROOT / "configs/experiments/cifar10-10clients.yaml",
+                          ["HPFL_local_iteration", "10", "runner.execution_backend", backend])
     output = tmp_path / "artifacts"
     output.mkdir()
     seen = []
@@ -124,6 +126,8 @@ def test_real_dispatch_uses_official_main(tmp_path, monkeypatch):
         assert "runner" not in resolved and resolved["HPFL_local_iteration"] == 10
         assert resolved["gpu_index"] == 0 and resolved["wandb_record"] is False
         assert resolved["data_dir"] == str(ROOT / ".local-data/cifar10")
+        assert resolved["client_execution_backend"] == backend
+        assert resolved["client_rng_policy"] == ("task-sha256-v1" if backend == "process" else "historical-global")
         wandb.run.summary["local_metric"] = 0.25
         seen.append(True)
 
