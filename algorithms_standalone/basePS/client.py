@@ -102,6 +102,11 @@ class Client(PSTrainer):
             global_other_params=None,
             traininig_start=False,
             shared_params_for_simulation=None):
+        def devices():
+            return (sorted({str(p.device) for p in self.trainer.model.parameters()}),
+                    sorted({str(v.device) for state in self.trainer.optimizer.state.values()
+                            for v in state.values() if isinstance(v, torch.Tensor)}))
+        boundary_model, boundary_optimizer = devices()
         self.client_timer.update_time_info(global_time_info)
         self.client_timer.past_comm_round(comm_round=1)
         time_info = self.client_timer.get_local_and_global_time_info()
@@ -123,7 +128,10 @@ class Client(PSTrainer):
                 shared_params_for_simulation, comm_round_idx=global_time_info["global_time_info"]["global_comm_round_idx"])
         local_train_tracker_info = self.train_tracker.encode_local_info(
             client_index, if_reset=True, metrics=self.metrics)
-        if self.args.instantiate_all:
+        if self.args.instantiate_all and self.args.model_residency == "cpu":
+            # 生モデルの退避だけでは返却済みstate_dictのCUDAストレージは解放されない。
+            for name, value in named_params.items():
+                named_params[name] = value.cpu()
             self.move_to_cpu()
 
         if self.args.data_save_memory_mode:
@@ -140,6 +148,13 @@ class Client(PSTrainer):
             self.clear_buffer()
 
         local_time_info = self.client_timer.get_time_info_to_send()
+        retained_model, retained_optimizer = devices()
+        self.last_residency_observation = dict(
+            event="residency", client_id=int(client_index),
+            round=self.client_timer.global_comm_round_idx,
+            model_residency=self.args.model_residency, capacity_policy=self.args.capacity_policy,
+            boundary_model_devices=boundary_model, boundary_optimizer_devices=boundary_optimizer,
+            retained_model_devices=retained_model, retained_optimizer_devices=retained_optimizer)
         return named_params, params_indexes, local_sample_number, other_client_params, \
             local_train_tracker_info, local_time_info, shared_params_for_simulation
 
@@ -153,9 +168,6 @@ class Client(PSTrainer):
             shared_params_for_simulation=None, **kwargs):
         named_params, params_indexes, local_sample_number, other_client_params = None, None, None, None
         return named_params, params_indexes, local_sample_number, other_client_params, shared_params_for_simulation
-
-
-
 
 
 

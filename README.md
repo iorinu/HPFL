@@ -43,6 +43,17 @@ bash tools/run-experiment.sh --config configs/experiments/cifar10-100clients.yam
 編集先は各YAML。`max_epochs` は省略時にround×local epochから自動算出する。
 共通runnerはGit flake（`.` / `.#gpu`）の依存環境とライブ作業ツリーを使い、git addは不要。
 
+### モデル常駐と最終保存（issue #2）
+
+既定は `model_residency=device`（CUDA は VRAM、CPU は RAM）、`capacity_policy=error`。
+未選択 client を含む現在のモデル・optimizer を保持し、容量不足では自動 CPU/disk 退避せず失敗する。
+8GB GPU に10/100-client presetが収まる保証はない。CPU保持は `model_residency cpu` の明示指定だけ。
+共有・head・marker・選択・全最終評価の成功後にだけ **`final-model.pt`**（共有モデル＋個別head＋marker＋対応表）を公開する。
+途中 `.pth`、比較contract、全roundのtensor履歴は既定で保存しない。resume/checkpoint_saveは非対応。
+比較専用の大きなdumpは合成runで `debug_tensor_dumps True` を明示する。
+旧issue1の保存・CPU往復・VRAM上限説明は今回の仕様で置き換わる。形式・再読込・障害時・容量予算は
+[詳細](docs/experiment-config.md#issue2-model-lifecycle)を参照。今回のCUDA常駐実機検証はHermesに委ねる。
+
 ### client並行学習（明示opt-in）
 
 既定のlegacy `sequential / 1` は維持する。標準FedAvg+HPFLの共有roundと最終headを、
@@ -70,7 +81,6 @@ CPU suiteに加え、[RTX 5060実機検証](docs/experiment-config.md#gpu-verifi
 If you do not want to use wandb for recording, you can add ``wandb_record=False`` in to the command (such as in experiments/standalone/auto_pipeline.sh and experiments/standalone/auto_pipeline_100client.sh). Then you don't need to install and config wandb.
 
 If else, please replace WANDB_KEY_EXAMPLE in configs/default.py, standalone/auto_pipeline.sh and experiments/standalone/auto_pipeline_100client.sh
-
 
 
 

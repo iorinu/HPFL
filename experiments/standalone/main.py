@@ -6,6 +6,9 @@ import random
 import socket
 import sys
 import yaml
+from pathlib import Path
+import tempfile
+import json
 
 import traceback
 
@@ -50,7 +53,7 @@ def add_args(parser):
     args = parser.parse_args()
     return args
 
-if __name__ == "__main__":
+def main():
     # initialize distributed computing (MPI)
 
     # parse python script input parameters
@@ -68,6 +71,14 @@ if __name__ == "__main__":
     # Build config once again
     cfg.setup(args)
     cfg.mode = 'standalone'
+    if cfg.algorithm == "FedAvg" and cfg.HPFL:
+        global run_output
+        # データの相対パス基準は出力隔離前の cwd を維持する。
+        cfg.data_dir = str(Path(cfg.data_dir).resolve())
+        # 旧入口でも既存 cwd のモデルを再利用・上書きしない。
+        run_output = Path(tempfile.mkdtemp(prefix="hpfl-run-", dir=Path.cwd())).resolve()
+        os.chdir(run_output)
+        (run_output / "result").mkdir()
 
     # cfg.rank = process_id
     # if cfg.algorithm in ['FedAvg', 'AFedAvg', 'PSGD', 'APSGD', 'Local_PSGD']:
@@ -302,3 +313,23 @@ if __name__ == "__main__":
         print("local_epoch_in_FedAvg:", cfg.global_epochs_per_round)
         print("model_name:", cfg.model)
 
+    if cfg.algorithm == "FedAvg" and cfg.HPFL:
+        from utils.final_artifact import publish_final
+        return publish_final(fedavg_manager, run_output)
+
+
+if __name__ == "__main__":
+    run_output = None
+    previous_directory = Path.cwd()
+    try:
+        from utils.final_artifact import publication_scope
+        with publication_scope():
+            artifact_info = main()
+            if run_output is not None:
+                (run_output / "status.json").write_text(json.dumps(dict(status="passed", artifact=artifact_info)))
+    except BaseException as exc:
+        if run_output is not None:
+            (run_output / "status.json").write_text(json.dumps(dict(status="failed", error=str(exc))))
+        raise
+    finally:
+        os.chdir(previous_directory)

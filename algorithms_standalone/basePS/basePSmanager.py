@@ -850,7 +850,8 @@ class BasePSManager(object):
             for i in range(self.args.central_trainning_epoch):
                 self.aggregator.trainer.train_one_epoch(train_data=train_dl, device=self.device)
                 print("epoch{} , ", i)
-            torch.save(self.aggregator.trainer.get_model_params(), f=f"{self.args.client_num_in_total}client_{self.args.algorithm}_{self.args.model}_{self.args.central_trainning_epoch}_epoch_alpha={self.args.partition_alpha}.pth")
+            if not (self.args.algorithm == "FedAvg" and self.args.HPFL):
+                torch.save(self.aggregator.trainer.get_model_params(), f=f"{self.args.client_num_in_total}client_{self.args.algorithm}_{self.args.model}_{self.args.central_trainning_epoch}_epoch_alpha={self.args.partition_alpha}.pth")
             for index,client in enumerate(self.client_list):
                 client.trainer.set_model_params(copy.deepcopy(self.aggregator.trainer.get_model_params()))
         acc=self.aggregator.trainer.test(self.test_global, device=self.device, tracker=self.total_test_tracker, metrics=self.metrics)
@@ -1057,6 +1058,9 @@ class BasePSManager(object):
             # change initial freeze_bn to train model with normal bn
             self.args.freeze_bn=False
             try:
+                if self.args.algorithm == "FedAvg" and self.args.HPFL:
+                    # 暗黙の過去モデル検出・resume は支持しない。
+                    raise FileNotFoundError("共有モデルはこの実行で学習します")
                 
                 # FedRod + HPFL , remember to remove after test
                 if self.args.load_backbone_from != None:
@@ -1152,9 +1156,10 @@ class BasePSManager(object):
                     wandb.log({"training_round":self.server_timer.global_comm_round_idx, "test_acc_in_this_round":acc})
                 self.aggregator.trainer.set_model_params(best_model)
                 for index,client in enumerate(self.client_list):
-                    client.trainer.set_model_params(copy.deepcopy(best_model))
+                    if self.args.client_execution_backend != "process":
+                        client.trainer.set_model_params(copy.deepcopy(best_model))
                     # show_memory()
-                torch.save(self.aggregator.trainer.get_model_params(), f"{self.args.client_num_in_total}client_{self.args.algorithm}_{self.args.model}_{self.args.dataset}_{self.args.comm_round}_round_alpha={self.args.partition_alpha}.pth")
+                # 最終保存は selection と全評価を所有する呼び出し側が行う。
                 wandb.run.summary[f"pretrain"]=True
                 # sync the random number generator
                 set_seed(self.args.seed)

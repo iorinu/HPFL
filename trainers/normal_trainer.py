@@ -80,7 +80,8 @@ def _release_process_client_after_test(method):
         try:
             return method(self, *args, **kwargs)
         finally:
-            if (getattr(self.args, "client_execution_backend", "sequential") == "process"
+            if ((getattr(self.args, "client_execution_backend", "sequential") == "process"
+                 or getattr(self.args, "model_residency", "device") == "cpu")
                     and self.role == "client"):
                 self.model.cpu()
     return evaluate
@@ -219,11 +220,11 @@ class NormalTrainer(ModelTrainer):
 
 
     def get_model_named_modules(self):
-        return dict(self.model.cpu().named_modules())
+        return dict(self.model.named_modules())
 
 
     def get_model_params(self):
-        return self.model.cpu().state_dict()
+        return self.model.state_dict()
 
     def set_model_params(self, model_parameters):
         # for name, param in model_parameters.items():
@@ -1862,8 +1863,6 @@ class NormalTrainer(ModelTrainer):
                 plt.title("t-SNE")
                 plt.savefig(image_path)
         return data_tsne, labels
-
-
 
 
 

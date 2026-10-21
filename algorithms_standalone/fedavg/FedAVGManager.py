@@ -33,6 +33,15 @@ class FedAVGManager(BasePSManager):
         self.client_executor = None
         self.process_history = []
         self.capture_process_history = False
+        self.worker_initialized_clients = set()
+        self.head_client_ids = []
+        if args.model_residency not in ("device", "cpu") or args.capacity_policy != "error":
+            raise ValueError("常駐先は device/cpu、容量方針は error のみ対応します")
+        if args.checkpoint_save:
+            raise ValueError("checkpoint_save/resume は未対応です")
+        if args.HPFL and (args.fedavg_cfl or args.if_OOD or args.reduce_plug
+                          or args.finetune_FedAvg or args.load_backbone_from is not None):
+            raise ValueError("推論形式 v1 は通常 HPFL のみ対応します（CFL/OOD/plug削減/finetune/resume は非対応）")
         if args.client_execution_backend == "process":
             from configs.experiment import validate_process_config
             validate_process_config(args)
@@ -64,6 +73,7 @@ class FedAVGManager(BasePSManager):
         logging.info("############_setup_server (START)#############")
         model = create_model(self.args, model_name=self.args.model, output_dim=self.args.model_output_dim,
                             device=self.device, pretrained=self.args.pretrained, **self.other_params)
+        model.to(self.device)
         num_iterations = get_avg_num_iterations(self.train_data_local_num_dict, self.args.batch_size)
         init_state_kargs = self.get_init_state_kargs()
         model_trainer = create_trainer(
@@ -87,12 +97,13 @@ class FedAVGManager(BasePSManager):
     def _setup_clients(self):
         logging.info("############setup_clients (START)#############")
         process_mode = self.args.client_execution_backend == "process"
-        client_device = torch.device("cpu") if process_mode else self.device
+        client_device = torch.device("cpu") if process_mode or self.args.model_residency == "cpu" else self.device
         init_state_kargs = self.get_init_state_kargs()
         # for client_index in range(self.args.client_num_in_total):
         for client_index in range(self.number_instantiated_client):
             model = create_model(self.args, model_name=self.args.model, output_dim=self.args.model_output_dim,
                             device=client_device, pretrained=self.args.pretrained, **self.other_params)
+            model.to(client_device)
             num_iterations = get_avg_num_iterations(self.train_data_local_num_dict, self.args.batch_size)
             model_trainer = create_trainer(
                 self.args, client_device, model, num_iterations=num_iterations,
@@ -127,6 +138,8 @@ class FedAVGManager(BasePSManager):
             signal.signal(signal.SIGTERM, terminate)
         try:
             return super().train()
+        except torch.OutOfMemoryError as exc:
+            raise RuntimeError("モデル常駐の容量不足です（capacity_policy=error）。自動 CPU/disk 退避は行いません") from exc
         finally:
             if self.client_executor is not None:
                 self.client_executor.close()
@@ -177,14 +190,39 @@ class FedAVGManager(BasePSManager):
                 self.client_executor = BoundedExecutor(
                     self.args.max_concurrent_clients, self.args.client_timeout_seconds,
                     train_task, initialize_worker, (trains, tests, self.train_data_local_num_dict))
+                initialization = []
+                for index, client in enumerate(self.client_list):
+                    state = export_client(client)
+                    initialization.append(dict(command="initialize", client_id=index,
+                                               worker_id=index % self.args.max_concurrent_clients,
+                                               round=0, phase="shared", config=dict(self.args),
+                                               device=str(self.device), state=state))
+                    # 親の CPU 初期状態は一度だけ渡し、以後は構造だけ残す。
+                    client.trainer.model.to("meta")
+                    client.trainer.optimizer.state.clear()
+                    for group in client.trainer.optimizer.param_groups:
+                        group["params"] = []
+                initialized = self.client_executor.run(initialization, observer=self._observe_resources)
+                for event in initialized:
+                    self._execution_event(event)
+                self.worker_initialized_clients.update(range(len(self.client_list)))
+                del initialization, state
             weights = cpu_tree(named_params)
             digest = weights_digest(weights)
-            tasks = [dict(client_id=int(index), round=round_index,
-                          phase="head" if round_index == self.max_comm_round else "shared",
-                          config=dict(self.args), device=str(self.device), weights=weights, weights_sha256=digest,
-                          state=export_client(self.client_list[index]),
-                          update=update_state_kargs, time=global_time_info) for index in client_indexes]
+            tasks = []
+            for index in client_indexes:
+                client = self.client_list[index]
+                state = None
+                if int(index) not in self.worker_initialized_clients:
+                    raise RuntimeError("未初期化 client です。所有権を確認してください")
+                tasks.append(dict(client_id=int(index), worker_id=int(index) % self.args.max_concurrent_clients,
+                                  round=round_index, phase="head" if round_index == self.max_comm_round else "shared",
+                                  config=dict(self.args), device=str(self.device), weights=weights, weights_sha256=digest,
+                                  state=state, debug=self.capture_process_history,
+                                  flags={k: p.requires_grad for k, p in client.trainer.model.named_parameters()},
+                                  update=update_state_kargs, time=global_time_info))
             results = self.client_executor.run(tasks, observer=self._observe_resources)
+            self.worker_initialized_clients.update(int(i) for i in client_indexes)
             if [r["client_id"] for r in results] != [int(i) for i in client_indexes]:
                 raise RuntimeError("worker の client 順序/ID が不正です")
             for result in results:
@@ -232,7 +270,7 @@ class FedAVGManager(BasePSManager):
         for i, client_index in enumerate(client_indexes):
 
             copy_global_other_params = copy.deepcopy(global_other_params)
-            if self.args.exchange_model == True:
+            if self.args.exchange_model == True and process_results is None:
                 copy_named_model_params = copy.deepcopy(named_params)
 
             if self.args.instantiate_all:
@@ -249,15 +287,21 @@ class FedAVGManager(BasePSManager):
 
             # client training.............
             if process_results is not None:
-                from .process_worker import restore_client
-                restore_client(client, process_results[i]["state"])
                 trained_result = process_results[i]["result"]
+                if self.server_timer.global_comm_round_idx == self.max_comm_round:
+                    client.trainer.model.to_empty(device="cpu")
+                    client.trainer.model.load_state_dict(trained_result[0])
+                    if self.capture_process_history:
+                        from .process_worker import restore_client
+                        client.trainer.optimizer.param_groups[0]["params"] = list(client.trainer.model.parameters())
+                        restore_client(client, process_results[i]["state"])
             else:
                 trained_result = client.train(update_state_kargs, global_time_info,
                     client_index, copy_named_model_params, params_type,
                     copy_global_other_params,
                     traininig_start=traininig_start,
                     shared_params_for_simulation=shared_params_for_simulation)
+                self._execution_event(client.last_residency_observation)
             model_params, model_indexes, local_sample_number, client_other_params, \
                 local_train_tracker_info, local_time_info, shared_params_for_simulation = trained_result
 
@@ -272,10 +316,13 @@ class FedAVGManager(BasePSManager):
                 # upload the Pluggable,and save it in aggregator
                 print("upload the Pluggable,and save it in aggregator")
                 self.aggregator.model_list.append(copy.deepcopy(list(client.trainer.model.children())[-self.args.freeze_layer:]))
+                self.head_client_ids.append(int(client_index))
                 # upload the distribution of feature extracted with backbone
                 # print("client.cal_dist(client_index)",client.cal_dist(client_index))
                 marker = (process_results[i]["marker"] if process_results is not None
                           else client.cal_dist(client_index))
+                if process_results is None and self.args.model_residency == "cpu":
+                    client.move_to_cpu()
                 self.aggregator.dist_list.append(copy.deepcopy(list(marker)))
                 print("upload successfully")
                 
@@ -305,6 +352,8 @@ class FedAVGManager(BasePSManager):
             if self.capture_process_history:
                 history["weights"] = cpu_tree(self.aggregator.get_global_model_params())
             self.process_history.append(history)
+        # 集約用の当該 round snapshot は履歴/cache として残さない。
+        self.aggregator.model_dict.clear()
         
         self.check_and_test()
         evaluation_end = time.monotonic()
@@ -332,5 +381,3 @@ class FedAVGManager(BasePSManager):
             return global_model_params, params_type, global_other_params, shared_params_for_simulation
         else:
             return 
-
-

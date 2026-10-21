@@ -97,7 +97,134 @@ batch128、SGD lr0.1 / momentum0.0 / wd0.0001、sched=`no`、HPFL有効、freeze
   保存先自体が書けない場合は記録を保証できないが、非ゼロ終了する。
   `.local-smoke/` の過去ログは変更しない。[旧smoke結果](local-smoke.md)は履歴として保持する。
 
-## メモリ懸念と起動方式の修正
+## 現在の仕様と過去記録の区別
+
+この節と後続のissue1検証記録は当時の履歴である。**現在の保存・常駐仕様は次節が優先**し、
+当時のCPU往復、worker数だけのCUDAモデル保持、暗黙 `.pth`/contract出力は廃止した。
+
+<a id="issue2-model-lifecycle"></a>
+
+## issue #2: 現在の常駐・保存契約
+
+対象は共通runnerの通常FedAvg+HPFL（sequential/process）と旧standalone mainの同経路。
+データ、sampling、batch、epoch、LR、metric、CPU MMDは変更しない。バックエンド既定はsequential/1のまま。
+v1ではCFL/OOD/plug削減/finetune/既存backbone読込の特殊推論・復旧経路はデータ取得前に拒否する。
+
+### 設定・所有権・容量
+
+平坦なHPFLキーとして、実効YAMLとexecution/summaryに次を記録する。
+
+```yaml
+model_residency: device  # device（既定）または明示的な cpu
+capacity_policy: error   # error のみ。自動CPU/disk spillなし
+debug_tensor_dumps: false
+checkpoint_save: false  # Trueは拒否。resumeは実装していない
+```
+
+- `device` は計算先と同じ常駐先（CUDAならVRAM、CPUならRAM）。sequentialはclientのmodel/BNとoptimizerを
+  round境界でCPUへ戻さない。`get_model_params`等の観測も生モデルをCPUへ移動しない。
+  `cpu` はclient model/optimizerをtask間RAMに保持し、計算時だけ指定deviceへ移す明示的な低VRAM選択。
+  sequentialの返却集約snapshotもCPUに置き、live model退避後にCUDAストレージを保持しない。
+  serverの計算モデルと最良共有snapshotは計算deviceに置く。
+- processは `client_id % max_concurrent_clients` の固定所有権でspawn workerへ割り当てる。
+  初回round前に**未選択clientを含む全client**を初期化し、model/optimizer/scheduler/timer/freeze/BN状態を
+  各workerでhead遷移まで保持する。並行**計算**は最大1または2だが、常駐モデル数はworker数ではなく全client数。
+  head終了後にworkerを回収する。失敗時もterminate/joinし、再試行しない。
+- 親は初期CPU状態を一度だけ渡し、以後clientの構造/freezeフラグをmeta tensorで保持する。
+  共有roundではoptimizer等のauthoritative状態を送受信せず、開始共有weightsと集約結果だけCPU IPC snapshotにする。
+  当該roundの集約snapshotは集約後に解放する。CPU IPC snapshotはVRAMからの状態退避でもdisk transportでもない。
+  最終head終了時だけ、既存の親所有・逐次評価に必要な最終clientモデルをCPUに復元する（optimizerミラーは不要）。
+  親がsampling順の集約、server/最良共有snapshot、head/markerの対応、選択と評価を所有する。
+- `task-sha256-v1` は維持する。旧実装がtaskごとにモデル初期化で消費したCPU RNGを保つため、
+  各taskで捨てるCPU一時モデルを一個構築する。live trainer/optimizerは再構築しない。
+  このCPU構築費用、初期転送、spawn/context、集約/評価IPC費用は残り、高速化の保証はない。
+  生trainerやCUDA tensorをspawnでpickleしない。途中iteratorのresumeは引き続き非対応。
+- VRAM予算にはserverと最良snapshot、**inactiveを含む全client**、momentum/optimizer、BN/freeze/scheduler状態、
+  gradient/activation、集約用一時状態、head/評価モデル、CUDA allocator予約と各process/contextを含める。
+  `cpu`でも計算とserverのVRAMは必要。host側も初期snapshot、最終評価ミラー、共有画像、markerとIPCを予算化する。
+  全歴史roundのモデルを保持しない（小さなmetric/hashログは保持）。
+- 信頼できる事前ピーク推定は未実装。実際のPyTorch OOMは明示的失敗となり、成功成果物を公開しない。
+  合成2/3-client CPU検証は容量保証ではない。RTX 5060約8GiBにResNetの10/100-client presetが収まると仮定しない。
+  実CUDAの小規模常駐確認は下記で成功したが、OOM限界・性能検証は未実施。MPS/WSL/GC/driver等は変更しない。
+
+### 最終成果物 v1・再読込・失敗
+
+通常のモデル成果物は一個の **`final-model.pt`**。合成は`artifacts/final-model.pt`、
+実データと旧mainは排他的に新設した`hpfl-run-ランダム/final-model.pt`（共通runnerなら`artifacts/`配下）。
+`summary.json`の`artifact.path`に実際の相対パス、SHA256、最終ファイルbytes/allocated bytes、最終モデルwrite数を記録する。
+
+- `format=hpfl-inference`, `version=1`, `resume_supported=False`。
+  `shared`は最良共有モデルのstate_dict（BNを含む）、`heads`は全個別headのstate_dict、
+  `markers`は既存選択に必要なmean/covariance/feature tensor。
+  `client_ids`と`client_to_head`はhead/marker slot対応、`config_yaml`は再構築条件、`metadata`は常駐/容量/RNG方針。
+  認証設定を含めず、tensorと安全なprimitiveだけを保存する。optimizerや学習履歴は含めず、学習再開用ではない。
+- `train()`は保存しない。共有学習、最良モデル選択、全head学習とmarker生成、personalized-data生成、
+  選択と**呼び出し側の全最終評価**の成功後にのみ保存する。旧mainも同じ境界を使う。
+  暗黙の既存`.pth`検出による学習skip/resumeは通常FedAvg+HPFLでは行わない。
+- 同一run内の新規`.final-*.tmp`へ一度serialize/fsyncし、同一filesystemのatomic hard-linkで
+  **既存宛先を置換せず**公開、temp名を除去する。renameの置換動作は使わない。
+  serialize/link失敗、OOM、head/選択/評価失敗、timeoutのSIGTERM、KeyboardInterruptでは自分の公開ファイルを取り消す。
+  成功summary/statusは公開後だけ。公開後のsummary/終了処理失敗も成功扱いせず取り消す。
+  既存出力は再利用・移動・削除しない。保存先故障時の失敗ログ、SIGKILL/電源断後のcleanupやdurabilityは保証しない。
+  確認できた例外では小さなfailed summary/statusを残す。外側launcherの非ゼロ終了値も確認する。
+
+```python
+from utils.final_artifact import load_final
+inference = load_final(".../final-model.pt", device="cpu")  # weights_only=True
+shared_logits = inference.logits(images)
+scores, head_slot = inference.select(loader)  # 既存CPU MMD
+personalized_logits = inference.logits(images, head_slot)
+client_id = inference.client_ids[head_slot]
+```
+
+個別logits計算では一時的なモデル複製が一個必要。GPU推論でもその予算を含める。
+test noise有効時の選択は従来同様にRNG依存で、実験のseed設定が必要。
+
+### 通常の小出力と比較opt-in
+
+通常はeffective config、command/status/log、metric/hash、最終一個だけ。
+自動tensor履歴はfalse。合成比較に限り `debug_tensor_dumps True` でprocessの全round共有tensor履歴と
+`process-contract.pt`/`legacy-contract.pt`を追加する。比較dumpも全評価後に作るが、**非常に大きい**RAM/diskを要し、
+全client optimizer等も含む。通常検証には使わない。これらは推論/復旧形式ではなく、resume非対応。
+旧issue1の比較テストはこのopt-inを明示するよう変更した。
+
+`client-execution.jsonl`にはsequentialの`residency`、processの初期化所有権とclient task境界の
+model/optimizer device、常駐client数、既存hash/RNG/forward数、peak RSS/VRAMと親観測を残す。
+CPUへのhash観測コピーをoffloadとは扱わない。各worker peakの和は同時VRAM peakではない。
+
+### CPU回帰・証拠
+
+証拠は新設 `.local-experiments/issue2-iWM35e0C/`。縦断動作ごとの`01`〜`13`のRED/GREENログを保持する。
+早期head失敗で旧 `.pth` 保存が実際にREDになることを確認し、保存境界、atomic公開、再読込logits/MMD、
+固定routing/subset、inactive client、永続状態と旧再構築のRNG、summary/終了失敗まで順に実装した。
+process/1対2、明示CPU保持対device保持は共有2round＋head、momentum0.9/StepLRの状態を比較する。
+実データ入口はdownloadせず合成loader置換でライフサイクルを検証する。過去のverified結果は変更しない。
+最終CPU suiteの件数はHermesの後続確認に委ね、ここでは確定値を記載しない。
+
+### Hermesによるissue2実CUDA検証（2026-10-21）
+
+根拠は `.local-experiments/hermes-issue2-cuda-8t5ix6ww/runs.json` と `comparison.json`。
+上記CPU回帰とは別に、単一RTX 5060で合成データ・共有2rounds＋head、momentum=0.9、StepLRを実行した。
+
+- sequential/device・process/1/device・process/2/device・process/2/明示cpu（各2clients）、
+  process/2/device（3clients）の計5runが成功。既定のモデル出力は各run `final-model.pt` 一個だけ。
+  2client成果物は約46,938,615 bytes（sequentialは46,938,679）、allocated bytesは46,940,160。
+- process/1対2、process/device対cpuは各132tensorの最大差0.0。historical baselineとの差は
+  sequentialで1.4551915228366852e-11、processで1.2732925824820995e-11で、rtol=1e-6 / atol=1e-7内。
+  対応するMMD値・選択も一致した。sequentialとprocessを同一RNG条件とは扱わない。
+- device保持workerの境界・保持model/optimizerはCUDA（初回optimizerは空）、明示cpu保持ではCPUを記録。
+  client所有PIDは安定し、3clients/2workersでも全clientの常駐を確認した。
+- driver全体のサンプル最大はprocess/1が1912MiB、process/2が2233MiB、3clientsが2367MiB。
+  他contextを含み、真のpeakや安全な容量上限を示さない。確認の一部でCPUテストが並行していたため、
+  throughput・高速化は主張しない。10/100clientsのGPU容量、実データ精度、kernel同時実行は未検証。
+- 既存モデル73ファイルのsize/mtime/inodeは保存された。旧issue1の検証結果は履歴として維持する。
+
+上記5runにはsequential/明示cpuは含まれない。その返却集約snapshotのCUDA保持不具合は、
+`tests/test_model_lifecycle.py::test_sequential_cuda_aggregation_snapshot_residency` の実CUDA回帰で
+device/cpu両保持を確認する（CPUのみの環境ではskip）。モデル・optimizerと集約器に渡るsnapshotを直接検査し、
+科学条件・RNGやdevice保持のlive stateは変更しない。
+
+## 履歴: メモリ懸念と起動方式の修正
 
 一時停止時の報告値はWindows空き約1GiB、vmmemWSL約23GB、WSL cache約20GiB。
 独立レビューで、旧path flakeのstore sourceにignore対象のlaunch出力6件が含まれていた。
@@ -118,6 +245,8 @@ VRAM peak allocated/reservedは221455360/251658240 bytes。いずれもモデル
 実データ10/100-client presetはcheckのみ成功。実データ取得・学習は実行していない。
 
 ## opt-in の bounded process client 学習
+
+**以下はissue1時点の説明と検証記録。保存・CPU往復・常駐モデル数は上記issue2仕様で置換済み。**
 
 既定は従来の **sequential / 1 / historical-global** のまま。GPU選択と並行数指定は独立している。
 単一 `cuda:0` またはCPU上で、spawnした永続workerを最大2個使い、共有roundと最終headを実行する。

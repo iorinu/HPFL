@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from utils.final_artifact import exclusive_run
 os.environ["WANDB_MODE"] = "disabled"
 os.environ["WANDB_DISABLED"] = "true"
 os.environ["MPLBACKEND"] = "Agg"
@@ -109,6 +110,7 @@ def main():
     run_smoke(cfg, options.device, output)
 
 
+@exclusive_run
 def run_smoke(cfg, device_name, output):
     from configs.experiment import hpfl_config
 
@@ -156,7 +158,7 @@ def run_smoke(cfg, device_name, output):
         torch.manual_seed(args.seed)
         with patch("algorithms_standalone.basePS.basePSmanager.load_data", lambda **kw: synthetic_data(cfg)):
             manager = FedAVGManager(device, args)
-        manager.capture_process_history = True
+        manager.capture_process_history = args.debug_tensor_dumps
         for client in manager.client_list:
             attach_device_probe(client.trainer, device, evidence, handles)
         attach_device_probe(manager.aggregator.trainer, device, evidence, handles)
@@ -166,15 +168,6 @@ def run_smoke(cfg, device_name, output):
         assert len(manager.aggregator.model_list) == cfg.client_num_in_total
         assert len(manager.aggregator.dist_list) == cfg.client_num_in_total
         process_mode = args.client_execution_backend == "process"
-        from algorithms_standalone.fedavg.process_worker import export_client, cpu_tree
-        torch.save(dict(clients=[export_client(c) for c in manager.client_list],
-                            global_model=cpu_tree(manager.aggregator.trainer.model.state_dict()),
-                            heads=[[cpu_tree(m.state_dict()) for m in head]
-                                   for head in manager.aggregator.model_list],
-                            markers=[[torch.as_tensor(v.copy()) for v in marker]
-                                     for marker in manager.aggregator.dist_list],
-                            history=manager.process_history),
-                   output / ("process-contract.pt" if process_mode else "legacy-contract.pt"))
         evaluation_start = time.monotonic()
         manager.generate_personalized_data()
         manager.test_locally()
@@ -216,8 +209,19 @@ def run_smoke(cfg, device_name, output):
                              peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
                              peak_reserved_bytes=torch.cuda.max_memory_reserved(device))
             assert cuda_info["peak_allocated_bytes"] > 0
-        checkpoints = sorted(str(path.relative_to(output)) for path in output.glob("*.pth"))
-        assert checkpoints
+        if args.debug_tensor_dumps:
+            from algorithms_standalone.fedavg.process_worker import export_client, cpu_tree
+            torch.save(dict(clients=[export_client(c) for c in manager.client_list],
+                            global_model=cpu_tree(manager.aggregator.trainer.model.state_dict()),
+                            heads=[[cpu_tree(m.state_dict()) for m in head]
+                                   for head in manager.aggregator.model_list],
+                            markers=[[torch.as_tensor(v.copy()) for v in marker]
+                                     for marker in manager.aggregator.dist_list],
+                            history=manager.process_history),
+                       output / ("process-contract.pt" if process_mode else "legacy-contract.pt"))
+        from utils.final_artifact import publish_final
+        artifact = publish_final(manager, output)
+        checkpoints = [artifact["path"]]
         result = dict(status="passed", synthetic=True, device=device_name, seed=args.seed,
                       shared_rounds=cfg.comm_round, local_epochs=cfg.global_epochs_per_round,
                       head_epochs=cfg.HPFL_local_iteration, clients=cfg.client_num_in_total,
@@ -226,6 +230,7 @@ def run_smoke(cfg, device_name, output):
                       model=args.model, markers=len(manager.aggregator.dist_list), mmd=scores, checkpoints=checkpoints,
                       seconds=elapsed, device_evidence=evidence, worker_evidence=worker_evidence,
                       execution_backend=cfg.runner.execution_backend, rng_policy=args.client_rng_policy,
+                      artifact=artifact, model_residency=args.model_residency, capacity_policy=args.capacity_policy,
                       mmd_evidence=mmd_evidence,
                       post_training_seconds=dict(local_evaluation=local_evaluation_end-evaluation_start,
                                                  mmd_selection=selection_end-local_evaluation_end,

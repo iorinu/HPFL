@@ -13,6 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from configs.experiment import load_experiment, hpfl_config
+from utils.final_artifact import exclusive_run
 
 RUN_ROOT = ROOT / ".local-experiments"
 launch_worker = subprocess.Popen
@@ -39,6 +40,9 @@ def execute_run(cfg, device, source, command, output=None, timeout=None, overrid
                                                               execution_backend=cfg.runner.execution_backend,
                                                               max_concurrent_clients=cfg.runner.max_concurrent_clients,
                                                               client_timeout_seconds=cfg.runner.client_timeout_seconds,
+                                                              model_residency=cfg.model_residency,
+                                                              capacity_policy=cfg.capacity_policy,
+                                                              debug_tensor_dumps=cfg.debug_tensor_dumps,
                                                               rng_policy=hpfl_config(cfg).client_rng_policy), indent=2) + "\n")
         artifacts = run / "artifacts"
         artifacts.mkdir()
@@ -69,6 +73,7 @@ def execute_run(cfg, device, source, command, output=None, timeout=None, overrid
     return run, status
 
 
+@exclusive_run
 def dispatch(cfg, device, output):
     from tools.local_smoke import run_smoke, select_device
 
@@ -96,12 +101,18 @@ def dispatch(cfg, device, output):
             run = wandb.init(mode="disabled")
             status = "failed"
             try:
-                runpy.run_path(entry, run_name="__main__")
+                namespace = runpy.run_path(entry, run_name="__main__")
+                artifact = namespace["artifact_info"]
+                if not artifact:
+                    raise RuntimeError("最終推論成果物が公開されませんでした")
+                artifact["path"] = str((namespace["run_output"] / artifact["path"]).relative_to(output))
                 status = "passed"
             finally:
                 try:
                     (output / "summary.json").write_text(json.dumps(
-                        dict(status=status, synthetic=False, device=device, metrics=dict(run.summary)),
+                        dict(status=status, synthetic=False, device=device, metrics=dict(run.summary),
+                             artifact=artifact if status == "passed" else None,
+                             model_residency=cfg.model_residency, capacity_policy=cfg.capacity_policy),
                         indent=2, default=lambda value: value.tolist(), ensure_ascii=False) + "\n")
                 finally:
                     run.finish()

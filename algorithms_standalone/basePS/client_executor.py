@@ -20,6 +20,7 @@ def _worker(connection, handler, initializer, initargs):
             if task is None:
                 break
             connection.send((True, handler(task)))
+            del task
     except BaseException:
         connection.send((False, traceback.format_exc()))
     finally:
@@ -56,14 +57,18 @@ class BoundedExecutor:
             raise RuntimeError("終了済み executor は再利用できません")
         results = [None] * len(tasks)
         pending = {}
-        next_index = 0
+        queues = {connection: [] for connection in self.connections}
+        for index, task in enumerate(tasks):
+            owner = task.get("worker_id", index % len(self.connections))
+            if type(owner) is not int or not 0 <= owner < len(self.connections):
+                raise ValueError("worker 割当が不正です")
+            queues[self.connections[owner]].append(index)
 
         def submit(connection):
-            nonlocal next_index
-            if next_index < len(tasks):
-                pending[connection] = (next_index, time.monotonic() + self.timeout)
-                connection.send(tasks[next_index])
-                next_index += 1
+            if queues[connection]:
+                index = queues[connection].pop(0)
+                pending[connection] = (index, time.monotonic() + self.timeout)
+                connection.send(tasks[index])
 
         try:
             if not self.initialized:

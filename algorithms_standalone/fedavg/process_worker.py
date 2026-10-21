@@ -1,4 +1,4 @@
-"""CPU の明示的状態だけを受け取り、worker 内で client を再構築する。"""
+"""固定 worker が client の学習状態を保持する。IPC は明示 CPU snapshot のみ。"""
 import copy
 import hashlib
 import os
@@ -139,10 +139,11 @@ def make_loader(spec):
 
 
 def initialize_worker(train_specs, test_specs, counts):
-    global _TRAIN, _TEST, _COUNTS
+    global _TRAIN, _TEST, _COUNTS, _CLIENTS
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     _TRAIN, _TEST, _COUNTS = train_specs, test_specs, counts
+    _CLIENTS = {}
 
 
 def train_task(task):
@@ -173,16 +174,45 @@ def train_task(task):
     args.checkpoint_save = False
     args.data_save_memory_mode = True
     args.wandb_record = False
-    trains = {client_id: make_loader(_TRAIN[client_id])}
-    tests = {client_id: make_loader(_TEST[client_id])}
+    # 旧 task のモデル初期化による RNG 消費も再現する。再利用する trainer の
+    # authoritative 状態には触れない。CPU 一時モデル一個の費用は残る。
     model = create_model(args, model_name=args.model, output_dim=args.model_output_dim,
                          device=torch.device("cpu"), pretrained=False)
-    trainer = create_trainer(args, device, model,
-                             num_iterations=get_avg_num_iterations(_COUNTS, args.batch_size),
-                             client_index=client_id, role="client")
-    client = FedAVGClient(client_id, trains, _COUNTS, tests, sum(_COUNTS.values()),
-                          device, args, trainer, metrics=Metrics([1], task=args.task))
-    restore_client(client, task["state"])
+    initialized = client_id not in _CLIENTS
+    if initialized:
+        trains = {client_id: make_loader(_TRAIN[client_id])}
+        tests = {client_id: make_loader(_TEST[client_id])}
+        trainer = create_trainer(args, device, model,
+                                 num_iterations=get_avg_num_iterations(_COUNTS, args.batch_size),
+                                 client_index=client_id, role="client")
+        client = FedAVGClient(client_id, trains, _COUNTS, tests, sum(_COUNTS.values()),
+                              device, args, trainer, metrics=Metrics([1], task=args.task))
+        if task.get("state") is None:
+            raise RuntimeError("初回 client 状態がありません。worker 所有権を確認してください")
+        restore_client(client, task["state"])
+        _CLIENTS[client_id] = client
+    else:
+        del model
+        client = _CLIENTS[client_id]
+        trainer = client.trainer
+        model = trainer.model
+        client.args = trainer.args = args
+    if task.get("command") == "initialize":
+        if args.model_residency == "device":
+            client.move_to_gpu(device)
+        else:
+            client.move_to_cpu()
+        return dict(client_id=client_id, pid=os.getpid(), event="retention_initialized",
+                    device=str(next(model.parameters()).device), model_residency=args.model_residency)
+    if task["phase"] == "head":
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = task["flags"][name]
+        for module in model.modules():
+            if isinstance(module, torch.nn.BatchNorm2d) and args.freeze_bn:
+                module.eval()
+    boundary_model_devices = sorted({str(p.device) for p in model.parameters()})
+    boundary_optimizer_devices = sorted({str(v.device) for state in trainer.optimizer.state.values()
+                                         for v in state.values() if isinstance(v, torch.Tensor)})
     forwards, losses = 0, 0
     loaded_digest = None
 
@@ -215,7 +245,8 @@ def train_task(task):
         torch.cuda.synchronize(device)
     trained = time.monotonic()
     marker = client.cal_dist(client_id) if task["phase"] == "head" else None
-    client.move_to_cpu()
+    if args.model_residency == "cpu":
+        client.move_to_cpu()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     end = time.monotonic()
@@ -229,8 +260,16 @@ def train_task(task):
                        loss_calls=losses, target_device=str(device),
                        start_weights_sha256=task["weights_sha256"], loaded_weights_sha256=loaded_digest,
                        seed=seed, rng_policy=RNG_POLICY,
+                       initialized=initialized, resident_clients=len(_CLIENTS),
+                       model_residency=args.model_residency, capacity_policy=args.capacity_policy,
+                       retained_model_devices=sorted({str(p.device) for p in model.parameters()}),
+                       boundary_model_devices=boundary_model_devices,
+                       boundary_optimizer_devices=boundary_optimizer_devices,
+                       retained_optimizer_devices=sorted({str(v.device) for state in trainer.optimizer.state.values()
+                                                          for v in state.values() if isinstance(v, torch.Tensor)}),
                        host_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                        cuda_peak_allocated_bytes=(torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0),
                        cuda_peak_reserved_bytes=(torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0))
-    return dict(client_id=client_id, result=cpu_tree(result), state=export_client(client),
+    return dict(client_id=client_id, result=cpu_tree(result),
+                state=export_client(client) if task.get("debug") else None,
                 marker=marker, observation=observation)

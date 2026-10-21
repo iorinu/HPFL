@@ -63,6 +63,14 @@ def load_experiment(path, overrides=()):
         validate_supplied({key: value})
     if cfg.runner.mode not in ("synthetic", "real"):
         raise ValueError("runner.mode: synthetic または real が必要です")
+    if cfg.model_residency not in ("device", "cpu") or cfg.capacity_policy != "error":
+        raise ValueError("model_residency は device/cpu、capacity_policy は error のみ対応します")
+    if cfg.checkpoint_save:
+        raise ValueError("checkpoint_save/resume は未対応です。最終推論成果物だけを保存します")
+    if cfg.runner.mode == "real" and cfg.debug_tensor_dumps:
+        raise ValueError("debug_tensor_dumps は synthetic 比較専用です")
+    if cfg.fedavg_cfl or cfg.if_OOD or cfg.reduce_plug or cfg.finetune_FedAvg:
+        raise ValueError("推論形式 v1 は通常 HPFL のみ対応します")
     if cfg.runner.execution_backend not in ("sequential", "process"):
         raise ValueError("runner.execution_backend: sequential または process が必要です")
     count = cfg.runner.max_concurrent_clients

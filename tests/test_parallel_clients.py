@@ -106,16 +106,17 @@ def test_cpu_process_one_two_rounds_heads_and_momentum(tmp_path):
     import torch
 
     runs = []
-    for workers in (1, 2):
-        output = tmp_path / f"process{workers}"
+    for workers, residency in ((1, "device"), (2, "device"), (2, "cpu")):
+        output = tmp_path / f"process{workers}-{residency}"
         output.mkdir()
         command = [sys.executable, "-m", "tools.run_experiment", "--worker", "--config",
                    str(ROOT / "configs/experiments/smoke.yaml"), "--output", str(output),
                    "runner.execution_backend", "process", "runner.max_concurrent_clients", str(workers),
-                   "comm_round", "2", "momentum", "0.9", "sched", "StepLR"]
-        with (tmp_path / f"process{workers}.log").open("w") as log:
+                   "comm_round", "2", "momentum", "0.9", "sched", "StepLR", "debug_tensor_dumps", "True",
+                   "model_residency", residency]
+        with (tmp_path / f"process{workers}-{residency}.log").open("w") as log:
             completed = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=180)
-        assert completed.returncode == 0, (tmp_path / f"process{workers}.log").read_text()
+        assert completed.returncode == 0, (tmp_path / f"process{workers}-{residency}.log").read_text()
         summary = json.loads((output / "summary.json").read_text())
         assert summary["status"] == "passed" and summary["markers"] == 2
         assert summary["shared_rounds"] == 2 and len(summary["mmd"]) == 2
@@ -161,17 +162,19 @@ def test_cpu_process_one_two_rounds_heads_and_momentum(tmp_path):
             assert a == b
 
     compare(runs[0][0], runs[1][0])
+    compare(runs[0][0], runs[2][0])
     import numpy as np
-    for a, b in zip(runs[0][1]["mmd"], runs[1][1]["mmd"]):
-        assert a["choice"] == b["choice"]
-        np.testing.assert_allclose(a["score"], b["score"], rtol=1e-6, atol=1e-7)
-    assert [t["seed"] for t in runs[0][2]] == [t["seed"] for t in runs[1][2]]
+    for run in runs[1:]:
+        for a, b in zip(runs[0][1]["mmd"], run[1]["mmd"]):
+            assert a["choice"] == b["choice"]
+            np.testing.assert_allclose(a["score"], b["score"], rtol=1e-6, atol=1e-7)
+        assert [t["seed"] for t in runs[0][2]] == [t["seed"] for t in run[2]]
     output = tmp_path / "legacy"
     output.mkdir()
     with (tmp_path / "legacy.log").open("w") as log:
         legacy = subprocess.run([sys.executable, "-m", "tools.run_experiment", "--worker", "--config",
                                  str(ROOT / "configs/experiments/smoke.yaml"), "--output", str(output),
-                                 "comm_round", "2", "momentum", "0.9", "sched", "StepLR"],
+                                 "comm_round", "2", "momentum", "0.9", "sched", "StepLR", "debug_tensor_dumps", "True"],
                                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, timeout=120)
     assert legacy.returncode == 0
     historical = torch.load(output / "legacy-contract.pt", weights_only=False)
@@ -370,6 +373,7 @@ def test_process_rng_with_canonical_random_augmentation_and_marker_noise(tmp_pat
         args.max_concurrent_clients = workers
         args.server_index = args.client_index = -1
         manager = FedAVGManager(torch.device("cpu"), args)
+        manager.capture_process_history = True
         manager.server_timer.global_comm_round_idx = manager.max_comm_round
         manager.freeze()
         try:

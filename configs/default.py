@@ -47,6 +47,9 @@ _C.aggregate_in_parallel = False
 # 共通 runner から明示的に転送する client 実行設定。既定の逐次経路は変更しない。
 _C.client_execution_backend = 'sequential'
 _C.max_concurrent_clients = 1
+_C.model_residency = 'device'
+_C.capacity_policy = 'error'
+_C.debug_tensor_dumps = False
 _C.client_timeout_seconds = 120.0
 _C.client_rng_policy = 'historical-global'
 

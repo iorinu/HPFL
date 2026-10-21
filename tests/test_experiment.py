@@ -130,6 +130,7 @@ def test_real_dispatch_uses_official_main(tmp_path, monkeypatch, backend):
         assert resolved["client_rng_policy"] == ("task-sha256-v1" if backend == "process" else "historical-global")
         wandb.run.summary["local_metric"] = 0.25
         seen.append(True)
+        return dict(artifact_info=dict(path="final-model.pt", model_write_count=1), run_output=output)
 
     monkeypatch.setattr("runpy.run_path", official)
     cwd = Path.cwd()
